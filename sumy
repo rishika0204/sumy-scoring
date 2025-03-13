@@ -1,112 +1,52 @@
-import pandas as pd
-import logging
-import re
-
-# Sumy imports
 from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lsa import LsaSummarizer
-# For replicating the internal LSA steps:
-from sumy.summarizers.lsa import numpy as np
-from sumy.summarizers.lsa import lsa as lsa_method
+from sumy.nlp.stemmers import Stemmer
+from sumy.utils import get_stop_words
+import numpy as np
 
-logging.basicConfig(
-    level=logging.INFO, 
-    format="%(asctime)s - %(name)s - %(message)s"
-)
+# === Input Text ===
+text = """Replace this string with the paragraph of text you want to summarize.
+It can be multiple sentences long. The script will identify the most important sentences
+using Sumy's LSA algorithm and print them along with their importance scores."""
+language = "english"
+top_n = 2  # number of sentences to include in summary
 
-# Read the Excel file
-df = pd.read_excel("C:/Users/2025344/Demo1/new_final_data_summary_5.xlsx")
+# Parse the text into a document
+parser = PlaintextParser.from_string(text, Tokenizer(language))
+document = parser.document
 
-def preprocess_text(text):
-    if not isinstance(text, str):
-        return ""
-    # Example cleanup (you can adjust as needed):
-    # 1. Remove ^ symbols
-    text = text.replace('^', '')
-    # 2. Remove numbered points, lettered points, etc. (regex placeholders)
-    text = re.sub(r'\(\d+\)', '', text)
-    text = re.sub(r'\(\w+\)', '', text)
-    # ... add any additional cleaning ...
-    return text
+# Initialize LSA Summarizer with optional stemming and stop words
+stemmer = Stemmer(language)
+summarizer = LsaSummarizer(stemmer)
+summarizer.stop_words = get_stop_words(language)
 
-def postprocess_text(text):
-    # Example post-processing
-    # 1. Remove leftover parentheses
-    text = text.replace('(', '').replace(')', '')
-    # 2. Remove extra spaces
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+# Generate summary (top N sentences) using Sumy
+summary_sentences = summarizer(document, sentences_count=top_n)
 
-def get_lsa_sentence_scores(paragraph):
-    """
-    Returns a list of (sentence_text, score) pairs for all sentences
-    in the paragraph, sorted by descending score.
-    """
-    # 1. Parse the paragraph
-    parser = PlaintextParser.from_string(paragraph, Tokenizer("english"))
-    document = parser.document
-    
-    # 2. Create the LSA summarizer
-    summarizer = LsaSummarizer()
-    # summarizer.stop_words = get_stop_words("english")  # optional
-    
-    # 3. Replicate the internal LSA pipeline:
-    #    (a) Build term-sentence matrix
-    tf_matrix = summarizer._build_matrix(document)
-    #    (b) Run the actual LSA (SVD)
-    singular_values, u, v = lsa_method(tf_matrix)
-    #    (c) Compute ratings
-    ratings = summarizer._get_sentence_ratings(tf_matrix, singular_values, document)
-    
-    # 4. Build a list of (sentence_text, score) for each sentence
-    sentence_score_pairs = []
-    for sentence_obj, score in ratings.items():
-        sentence_text = str(sentence_obj)
-        sentence_score_pairs.append((sentence_text, score))
-    
-    # 5. Sort by descending score
-    sentence_score_pairs.sort(key=lambda x: x[1], reverse=True)
-    return sentence_score_pairs
+# Compute Sumy's internal sentence scores via the LSA components
+# 1. Build term-frequency matrix as Sumy does
+dictionary = summarizer._create_dictionary(document)
+if not dictionary:
+    scores = []  # empty document edge case
+else:
+    matrix = summarizer._create_matrix(document, dictionary)
+    matrix = summarizer._compute_term_frequency(matrix)
+    # 2. Perform SVD (using numpy.linalg.svd)
+    u, sigma, v = np.linalg.svd(matrix, full_matrices=False)
+    # 3. Compute ranks using Sumy's formula
+    scores = summarizer._compute_ranks(sigma, v)
 
-def summarize_paragraph(paragraph, sentence_count=2):
-    """
-    Returns the LSA-based summary text for the given paragraph.
-    """
-    if not isinstance(paragraph, str):
-        return ""
-    parser = PlaintextParser.from_string(paragraph, Tokenizer("english"))
-    summarizer = LsaSummarizer()
-    summary_sentences = summarizer(parser.document, sentence_count)
-    
-    # Convert Sentence objects to strings
-    summary_text = " ".join(str(s) for s in summary_sentences)
-    summary_text = postprocess_text(summary_text)
-    return summary_text
+# Sort sentences by score (descending)
+score_index_pairs = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
 
-# Lists to hold the summary and scores
-summaries_list = []
-scores_list = []
+# === Output Results ===
+print("Summary (Top {} Sentences):".format(top_n))
+for sentence in summary_sentences:
+    print("-", sentence)  # sentence is a Sentence object; printing yields its text
 
-for idx, row in df.iterrows():
-    # Adjust the column index or name as needed
-    paragraph = row.iloc[0]  # e.g., first column
-    paragraph = preprocess_text(paragraph)
-    
-    # 1. Get the summary (e.g., top 2 sentences)
-    summary_text = summarize_paragraph(paragraph, sentence_count=2)
-    summaries_list.append(summary_text)
-    
-    # 2. Get all (sentence, score) pairs for the paragraph
-    sentence_scores = get_lsa_sentence_scores(paragraph)
-    scores_list.append(sentence_scores)
-
-# Add the new columns to the DataFrame
-df["Summary_LSA"] = summaries_list
-df["Sentence_Scores_LSA"] = scores_list  # list of tuples, descending by score
-
-# Save back to Excel
-output_path = "C:/Users/2025344/Demo1/new_final_data_summary_with_scores.xlsx"
-df.to_excel(output_path, index=False)
-
-logging.info("Summaries and sentence scores have been appended successfully!")
+print("\nAll Sentences Ranked by Importance:")
+for idx, score in score_index_pairs:
+    # Convert sentence object to string for printing
+    sentence_text = str(document.sentences[idx])
+    print(f"{score:.4f} - {sentence_text}")
