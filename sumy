@@ -1,52 +1,115 @@
-from sumy.parsers.plaintext import PlaintextParser
-from sumy.nlp.tokenizers import Tokenizer
-from sumy.summarizers.lsa import LsaSummarizer
-from sumy.nlp.stemmers import Stemmer
-from sumy.utils import get_stop_words
-import numpy as np
+import pandas as pd
+import re
+from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import classification_report, accuracy_score
+from nltk.corpus import stopwords
+import nltk
 
-# === Input Text ===
-text = """Replace this string with the paragraph of text you want to summarize.
-It can be multiple sentences long. The script will identify the most important sentences
-using Sumy's LSA algorithm and print them along with their importance scores."""
-language = "english"
-top_n = 2  # number of sentences to include in summary
+# Make sure you have downloaded the NLTK stopwords if needed
+# nltk.download('stopwords')
 
-# Parse the text into a document
-parser = PlaintextParser.from_string(text, Tokenizer(language))
-document = parser.document
+# ------------------------------------------------------------------
+# 1. Load the data
+# ------------------------------------------------------------------
+# Adjust file paths and columns as needed
+train_df = pd.read_csv('train.tsv', sep='\t', header=None, names=['text', 'label'])
+dev_df   = pd.read_csv('dev.tsv',   sep='\t', header=None, names=['text', 'label'])
 
-# Initialize LSA Summarizer with optional stemming and stop words
-stemmer = Stemmer(language)
-summarizer = LsaSummarizer(stemmer)
-summarizer.stop_words = get_stop_words(language)
+# If your test set has labels
+test_df  = pd.read_csv('test.csv', sep=',', header=None, names=['text', 'label'])
 
-# Generate summary (top N sentences) using Sumy
-summary_sentences = summarizer(document, sentences_count=top_n)
+# If your test set does NOT have labels, do this instead:
+# test_df  = pd.read_csv('test.csv', sep=',', header=None, names=['text'])
 
-# Compute Sumy's internal sentence scores via the LSA components
-# 1. Build term-frequency matrix as Sumy does
-dictionary = summarizer._create_dictionary(document)
-if not dictionary:
-    scores = []  # empty document edge case
+# ------------------------------------------------------------------
+# 2. Basic text preprocessing function
+# ------------------------------------------------------------------
+def preprocess_text(text):
+    # Lowercase
+    text = text.lower()
+    # Remove punctuation (optional; sometimes keeping punctuation can help)
+    text = re.sub(r'[^\w\s]', '', text)
+    # Strip extra whitespace
+    text = text.strip()
+    return text
+
+# Apply preprocessing to all datasets
+train_df['text'] = train_df['text'].apply(preprocess_text)
+dev_df['text']   = dev_df['text'].apply(preprocess_text)
+test_df['text']  = test_df['text'].apply(preprocess_text)
+
+# ------------------------------------------------------------------
+# 3. Define a Pipeline (Tfidf + Naive Bayes)
+# ------------------------------------------------------------------
+pipeline = Pipeline([
+    ('vectorizer', TfidfVectorizer(stop_words=stopwords.words('english'))),
+    ('classifier', MultinomialNB())
+])
+
+# ------------------------------------------------------------------
+# 4. Hyperparameter Tuning with GridSearchCV
+# ------------------------------------------------------------------
+# We will search over a few common parameters:
+# - ngram_range: (1,1) = unigrams only, (1,2) = unigrams + bigrams
+# - min_df: minimum document frequency for a token
+# - alpha: smoothing parameter for Naive Bayes
+param_grid = {
+    'vectorizer__ngram_range': [(1, 1), (1, 2)],
+    'vectorizer__min_df': [1, 2, 5],
+    'classifier__alpha': [0.1, 1, 5]
+}
+
+grid_search = GridSearchCV(
+    pipeline, 
+    param_grid, 
+    cv=3,               # 3-fold cross-validation
+    scoring='accuracy', # or 'f1_macro' if class imbalance is high
+    verbose=1,
+    n_jobs=-1           # Use all available cores for speed
+)
+
+# ------------------------------------------------------------------
+# 5. Fit on training data, evaluate on dev set
+# ------------------------------------------------------------------
+grid_search.fit(train_df['text'], train_df['label'])
+
+print("\nBest Hyperparameters found via GridSearch:")
+print(grid_search.best_params_)
+
+best_model = grid_search.best_estimator_
+
+# Evaluate on dev set
+dev_preds = best_model.predict(dev_df['text'])
+print("\nDevelopment Set Evaluation:")
+print(classification_report(dev_df['label'], dev_preds))
+print("Dev Accuracy:", accuracy_score(dev_df['label'], dev_preds))
+
+# ------------------------------------------------------------------
+# 6. (Optional) Retrain on combined (train + dev) for final model
+# ------------------------------------------------------------------
+# If you want to squeeze out maximum performance on the test set,
+# you can combine train + dev, then refit the best_model's pipeline.
+train_dev_df = pd.concat([train_df, dev_df], axis=0)
+
+best_model.fit(train_dev_df['text'], train_dev_df['label'])
+
+# ------------------------------------------------------------------
+# 7. Test Set Predictions
+# ------------------------------------------------------------------
+if 'label' in test_df.columns:
+    # If your test set has labels, evaluate performance
+    test_preds = best_model.predict(test_df['text'])
+    print("\nTest Set Evaluation:")
+    print(classification_report(test_df['label'], test_preds))
+    print("Test Accuracy:", accuracy_score(test_df['label'], test_preds))
 else:
-    matrix = summarizer._create_matrix(document, dictionary)
-    matrix = summarizer._compute_term_frequency(matrix)
-    # 2. Perform SVD (using numpy.linalg.svd)
-    u, sigma, v = np.linalg.svd(matrix, full_matrices=False)
-    # 3. Compute ranks using Sumy's formula
-    scores = summarizer._compute_ranks(sigma, v)
-
-# Sort sentences by score (descending)
-score_index_pairs = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
-
-# === Output Results ===
-print("Summary (Top {} Sentences):".format(top_n))
-for sentence in summary_sentences:
-    print("-", sentence)  # sentence is a Sentence object; printing yields its text
-
-print("\nAll Sentences Ranked by Importance:")
-for idx, score in score_index_pairs:
-    # Convert sentence object to string for printing
-    sentence_text = str(document.sentences[idx])
-    print(f"{score:.4f} - {sentence_text}")
+    # If test set has no labels, just predict and possibly save
+    test_preds = best_model.predict(test_df['text'])
+    print("\nPredictions on Test Set (no labels available):")
+    for i, pred in enumerate(test_preds[:10]):
+        print(f"Text: {test_df['text'][i]} --> Predicted Label: {pred}")
+    # Optionally save all predictions to file
+    # pd.DataFrame({'text': test_df['text'], 'pred_label': test_preds}).to_csv('test_predictions.csv', index=False)
