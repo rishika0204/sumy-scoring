@@ -1,18 +1,25 @@
+window_size = 3
+covered_cooccurrences = set()
+
 for window_start in range(len(processed_text) - window_size + 1):
-    # Instead of window = processed_text[window_start:window_start+window_size]
-    # we just use indices directly.
-    
-    # For each i in the current window...
+    # Loop i from window_start up to the second-last element of this window
     for i in range(window_start, window_start + window_size - 1):
         word_i = processed_text[i]
         index_of_i = word_index[word_i]
-        
-        # Only loop j from i+1 up to the end of this window.
+
+        # Loop j only from i+1 up to the end of this window
         for j in range(i + 1, window_start + window_size):
             word_j = processed_text[j]
             index_of_j = word_index[word_j]
+            dist = abs(j - i)
 
-            # Add/update your edge just once rather than i->j and j->i separately.
+            # Add (i->j) if not already covered
             if (index_of_i, index_of_j) not in covered_cooccurrences:
-                weighted_edge[index_of_i][index_of_j] += 1.0 / (j - i)
+                weighted_edge[index_of_i][index_of_j] += 1.0 / dist
                 covered_cooccurrences.add((index_of_i, index_of_j))
+
+            # Add (j->i) if not already covered (to keep the symmetry)
+            if (index_of_j, index_of_i) not in covered_cooccurrences:
+                weighted_edge[index_of_j][index_of_i] += 1.0 / dist
+                covered_cooccurrences.add((index_of_j, index_of_i))
+
