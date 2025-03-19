@@ -1,0 +1,166 @@
+import pandas as pd
+import numpy as np
+import nltk
+from nltk import word_tokenize
+from nltk.stem import WordNetLemmatizer
+from scipy.sparse import lil_matrix, csr_matrix
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.decomposition import LatentDirichletAllocation
+
+# Make sure NLTK resources are downloaded
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger')
+nltk.download('wordnet')
+
+def clean_text(text):
+    """Minimal text cleaning: lowercasing and removing non-printable chars."""
+    import string
+    if isinstance(text, float):
+        return ""
+    text = text.lower()
+    printable = set(string.printable)
+    return "".join(ch for ch in text if ch in printable)
+
+def find_keywords(text, top_k=50):
+    """
+    Your TextRank-style keyword extractor (simplified). 
+    Returns a comma-separated string of top keywords.
+    (This is the same structure as in your original code snippet.)
+    """
+    # 1. Clean & tokenize
+    text_clean = clean_text(text)
+    tokens = word_tokenize(text_clean)
+    if not tokens:
+        return ""
+    
+    # 2. Lemmatize & filter by POS
+    pos_tags = nltk.pos_tag(tokens)
+    lemmatizer = WordNetLemmatizer()
+    adjective_tags = {"JJ", "JJR", "JJS"}
+    lemmatized_text = []
+    for (word, tag) in pos_tags:
+        if tag in adjective_tags:
+            w_lemma = lemmatizer.lemmatize(word, 'a')
+        else:
+            w_lemma = lemmatizer.lemmatize(word)
+        lemmatized_text.append(w_lemma)
+    
+    # Simple example: keep only certain POS
+    pos_tags_2 = nltk.pos_tag(lemmatized_text)
+    keep_tags = {"NN", "NNS", "NNP", "NNPS", "JJ", "JJR", "JJS", "VBG", "FW"}
+    removed_words = [w for (w, t) in pos_tags_2 if t not in keep_tags]
+    
+    import string
+    punctuation = list(string.punctuation)
+    stopwords_plus = set(removed_words + punctuation)
+    
+    processed_text = [w for w in lemmatized_text if w not in stopwords_plus]
+    if not processed_text:
+        return ""
+    
+    # Build a small co-occurrence graph (for demonstration)
+    vocabulary = list(set(processed_text))
+    vocab_len = len(vocabulary)
+    word_index = {word: idx for idx, word in enumerate(vocabulary)}
+    window_size = 3
+    weighted_edge = lil_matrix((vocab_len, vocab_len), dtype=np.float32)
+    
+    # Sliding window for co-occurrence
+    for start_i in range(len(processed_text) - window_size + 1):
+        window_words = processed_text[start_i : start_i + window_size]
+        for j in range(window_size):
+            idx_i = word_index[window_words[j]]
+            for k in range(j + 1, window_size):
+                idx_j = word_index[window_words[k]]
+                if idx_i == idx_j:
+                    continue
+                dist = abs(j - k) or 1
+                weighted_edge[idx_i, idx_j] += 1.0 / dist
+                weighted_edge[idx_j, idx_i] += 1.0 / dist
+
+    # Convert to CSR and do a simple PageRank
+    weighted_edge = weighted_edge.tocsr()
+    inout = np.array(weighted_edge.sum(axis=1)).flatten()
+    inout[inout == 0] = 1e-9
+    T_csc = weighted_edge.tocsc()
+    for j in range(vocab_len):
+        start_ptr, end_ptr = T_csc.indptr[j], T_csc.indptr[j+1]
+        T_csc.data[start_ptr:end_ptr] /= inout[j]
+    T = T_csc.tocsr()
+
+    # PageRank
+    score = np.ones(vocab_len, dtype=np.float32)
+    damping_factor = 0.85
+    max_iterations = 50
+    threshold = 1e-4
+    for _ in range(max_iterations):
+        prev_score = score.copy()
+        score = (1 - damping_factor) + damping_factor * (T.dot(prev_score))
+        if np.sum(np.abs(score - prev_score)) <= threshold:
+            break
+    
+    # Sort by score
+    sorted_idx = np.argsort(score)[::-1]
+    top_k = min(top_k, vocab_len)
+    top_words = [vocabulary[i] for i in sorted_idx[:top_k]]
+    # Return them as a comma-separated string
+    return ", ".join(top_words)
+
+def main():
+    # -----------------------------
+    # 1. Read the Excel data
+    # -----------------------------
+    df = pd.read_excel(r"C:/Users/2025344/Demo1/issues_data.xlsx")
+    # Suppose each row in column 13 is a separate 'document'
+    documents = df.iloc[:, 13].dropna().astype(str).tolist()
+    
+    # -----------------------------
+    # 2. Build a custom vocabulary
+    #    from the entire corpus
+    # -----------------------------
+    # Combine all documents into one big text to find top keywords overall
+    combined_text = " ".join(documents)
+    keyword_string = find_keywords(combined_text, top_k=50)
+    
+    # The above returns a comma-separated string. Convert to a list and deduplicate
+    raw_keywords = [kw.strip() for kw in keyword_string.split(",") if kw.strip()]
+    # optional dedup:
+    custom_vocabulary = list(dict.fromkeys(raw_keywords))
+    
+    print("Custom vocabulary (keywords) extracted:")
+    print(custom_vocabulary)
+    
+    # If the custom vocabulary is empty, there's nothing to vectorize
+    if not custom_vocabulary:
+        print("No keywords found. Exiting.")
+        return
+
+    # -----------------------------
+    # 3. Vectorize each document 
+    #    against this custom vocabulary
+    # -----------------------------
+    # CountVectorizer will only count occurrences of these custom keywords
+    vectorizer = CountVectorizer(vocabulary=custom_vocabulary)
+    dtm = vectorizer.transform(documents)  # shape: (num_docs, len(custom_vocabulary))
+    print(f"\nDocument–Term Matrix shape: {dtm.shape}")
+
+    # -----------------------------
+    # 4. Run LDA on this DTM
+    # -----------------------------
+    num_topics = 5
+    lda = LatentDirichletAllocation(n_components=num_topics, random_state=42)
+    lda.fit(dtm)
+    
+    # -----------------------------
+    # 5. Print the discovered topics
+    # -----------------------------
+    feature_names = vectorizer.get_feature_names_out()
+    num_top_words = 10
+    for topic_idx, topic in enumerate(lda.components_):
+        top_indices = topic.argsort()[::-1][:num_top_words]
+        top_terms = [feature_names[i] for i in top_indices]
+        print(f"\nTopic {topic_idx + 1}:")
+        print(", ".join(top_terms))
+
+if __name__ == "__main__":
+    main()
