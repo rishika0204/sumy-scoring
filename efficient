@@ -1,24 +1,232 @@
-import itertools
+import re
+import string
+import numpy as np
+import pandas as pd
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from nltk.stem import WordNetLemmatizer
 
-window_size = 3
-covered_cooccurrences = set()
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger')
+nltk.download('wordnet')
+nltk.download('stopwords')
 
-for window_start in range(len(processed_text) - window_size + 1):
-    # Generate all unique i,j pairs in this window in one shot:
-    window_indices = range(window_start, window_start + window_size)
-    for i, j in itertools.combinations(window_indices, 2):
-        word_i = processed_text[i]
-        word_j = processed_text[j]
-        index_of_i = word_index[word_i]
-        index_of_j = word_index[word_j]
-        dist = abs(j - i)
+def clean_text(text):
+    """
+    Quickly clean text by removing non-printable characters and 
+    making it lowercase. Adjust regex as needed for your data.
+    """
+    if isinstance(text, float):
+        return ""
+    # Lowercase
+    text = text.lower()
+    # Keep letters, numbers, spaces (remove punctuation in a later step if desired)
+    text = re.sub(r'[^a-z0-9\s]+', '', text)
+    return text
 
-        # Add (i->j) if not already covered
-        if (index_of_i, index_of_j) not in covered_cooccurrences:
-            weighted_edge[index_of_i][index_of_j] += 1.0 / dist
-            covered_cooccurrences.add((index_of_i, index_of_j))
+def build_stopwords():
+    """
+    Build a set of stopwords from NLTK plus punctuation and any extra file-based stopwords.
+    """
+    base_stopwords = set(stopwords.words('english'))
+    punctuation_list = list(string.punctuation)
 
-        # Add (j->i) if you want symmetry:
-        if (index_of_j, index_of_i) not in covered_cooccurrences:
-            weighted_edge[index_of_j][index_of_i] += 1.0 / dist
-            covered_cooccurrences.add((index_of_j, index_of_i))
+    # Attempt to read additional stopwords from a file
+    # Replace "long_stopwords.txt" with your actual path if needed
+    extra_stopwords = []
+    try:
+        with open("long_stopwords.txt", "r") as f:
+            extra_stopwords = [line.strip().lower() for line in f if line.strip()]
+    except FileNotFoundError:
+        # If file doesn't exist, just ignore
+        pass
+
+    # Combine all stopwords into a single set for O(1) lookups
+    all_stopwords = base_stopwords.union(punctuation_list, extra_stopwords)
+    return all_stopwords
+
+def find_keywords(text):
+    """
+    Main function to extract keywords from text using a TextRank-like approach:
+    1. Clean and tokenize
+    2. POS tagging, lemmatization
+    3. Build co-occurrence matrix
+    4. Run PageRank
+    5. Extract top phrases as keywords
+    """
+    # ----------------------
+    # 1. Clean and tokenize
+    # ----------------------
+    cleaned_text = clean_text(text)
+    tokens = word_tokenize(cleaned_text)
+    if not tokens:
+        return ""
+
+    # ----------------------
+    # 2. POS tagging, lemmatization
+    # ----------------------
+    pos_tags = nltk.pos_tag(tokens)
+    lemmatizer = WordNetLemmatizer()
+
+    # Example: If you specifically want adjectives lemmatized with pos='a'
+    adjective_tags = {'JJ', 'JJR', 'JJS'}
+    lemmatized_text = []
+    for (word, tag) in pos_tags:
+        if tag in adjective_tags:
+            # Lemmatize as adjective
+            lemma = lemmatizer.lemmatize(word, 'a')
+        else:
+            # Default lemma
+            lemma = lemmatizer.lemmatize(word)
+        lemmatized_text.append(lemma)
+
+    # Get updated POS tags after lemmatization (if you need to filter again)
+    pos_tags_lemma = nltk.pos_tag(lemmatized_text)
+
+    # Build a new stopword list based on your criteria
+    # (You appear to keep nouns, adjectives, gerunds, foreign words, etc.)
+    # Here we do the reverse: anything *not* in certain tags is a stopword.
+    # Adjust as needed.
+    keep_tags = {'NN', 'NNS', 'NNP', 'NNPS', 'JJ', 'JJR', 'JJS', 'VBG', 'FW'}
+    # If a token’s POS tag is not in keep_tags, it’s effectively a stopword
+    custom_stopwords = {w for (w, t) in pos_tags_lemma if t not in keep_tags}
+
+    # Combine with your general stopwords from file + punctuation
+    base_stopwords = build_stopwords()
+    all_stopwords = base_stopwords.union(custom_stopwords)
+
+    # Filter out stopwords
+    processed_text = [w for w in lemmatized_text if w not in all_stopwords]
+    if not processed_text:
+        return ""
+
+    # ----------------------
+    # 3. Build co-occurrence matrix
+    # ----------------------
+    vocabulary = list(set(processed_text))  # unique words
+    vocab_len = len(vocabulary)
+    word_index = {word: idx for idx, word in enumerate(vocabulary)}
+
+    # Create adjacency matrix
+    # For large vocabularies, consider using scipy.sparse
+    weighted_edge = np.zeros((vocab_len, vocab_len), dtype=np.float32)
+
+    # Window size for co-occurrence
+    window_size = 3
+
+    # Build edges
+    for i in range(len(processed_text) - window_size + 1):
+        window_words = processed_text[i : i + window_size]
+        # Connect all pairs in this window
+        for w1 in window_words:
+            for w2 in window_words:
+                if w1 != w2:
+                    idx1 = word_index[w1]
+                    idx2 = word_index[w2]
+                    weighted_edge[idx1, idx2] += 1.0
+
+    # ----------------------
+    # 4. PageRank (Vectorized)
+    # ----------------------
+    # Initialize scores
+    score = np.ones(vocab_len, dtype=np.float32)
+    # Sum over columns for normalization (we use column-based approach)
+    inout = weighted_edge.sum(axis=0)  # each column's sum
+
+    # Avoid division by zero
+    inout[inout == 0] = 1e-9
+
+    # Build a column-normalized matrix M: M[i,j] = weighted_edge[i,j] / inout[j]
+    M = weighted_edge / inout
+
+    # PageRank parameters
+    damping_factor = 0.85
+    max_iterations = 50
+    threshold = 0.0001
+
+    for _ in range(max_iterations):
+        prev_score = score.copy()
+        # score_new = (1 - d) + d * M.dot(prev_score)
+        score = (1 - damping_factor) + damping_factor * M.dot(prev_score)
+        # Check convergence
+        if np.sum(np.abs(prev_score - score)) <= threshold:
+            break
+
+    # ----------------------
+    # 5. Build phrases, score them
+    # ----------------------
+    # Re-scan the lemmatized_text to form phrases separated by stopwords
+    phrases = []
+    current_phrase = []
+
+    stopwords_set = set(all_stopwords)  # for faster membership checks
+
+    for word in lemmatized_text:
+        if word in stopwords_set:
+            # End of a phrase
+            if current_phrase:
+                phrases.append(current_phrase)
+                current_phrase = []
+        else:
+            current_phrase.append(word)
+    # Catch any trailing phrase
+    if current_phrase:
+        phrases.append(current_phrase)
+
+    # De-duplicate phrases
+    unique_phrases = []
+    seen_phrases = set()
+    for ph in phrases:
+        tuple_ph = tuple(ph)  # convert to tuple for set hashing
+        if tuple_ph not in seen_phrases:
+            seen_phrases.add(tuple_ph)
+            unique_phrases.append(ph)
+
+    # Remove single-word phrases if they also appear in a multi-word phrase
+    # This was in your original code, but we can do it more directly
+    single_words = {tuple([w]) for w in vocabulary}  # set of single-word tuples
+    multi_phrases = {tuple(ph) for ph in unique_phrases if len(ph) > 1}
+    # If a single-word phrase is also part of multi_phrases, remove it
+    final_phrases = []
+    for ph in unique_phrases:
+        tuple_ph = tuple(ph)
+        if not (tuple_ph in single_words and tuple_ph in multi_phrases):
+            final_phrases.append(ph)
+
+    # Score each phrase by summing the scores of its words
+    phrase_scores = []
+    for ph in final_phrases:
+        p_score = sum(score[word_index[w]] for w in ph if w in word_index)
+        phrase_scores.append(p_score)
+
+    # Sort by descending score
+    sorted_indices = np.argsort(phrase_scores)[::-1]
+    # Limit to top 50 (or whatever you prefer)
+    top_n = min(50, len(sorted_indices))
+
+    keywords_list = []
+    for i in range(top_n):
+        idx_ = sorted_indices[i]
+        keyword_phrase = " ".join(final_phrases[idx_])
+        keywords_list.append(keyword_phrase.strip())
+
+    return ", ".join(keywords_list)
+
+def main():
+    df = pd.read_excel(r"C:/Users/2025344/Demo1/issues_data.xlsx")
+    # Example: use column index 13
+    column_data = df.iloc[:, 13]
+    combined_text = " ".join(column_data.dropna().astype(str).tolist())
+
+    # Split data (80%/20%) if desired
+    split_index = int(len(combined_text) * 0.8)
+    train_text = combined_text[:split_index]
+    test_text = combined_text[split_index:]
+
+    # Extract keywords
+    keywords = find_keywords(train_text)
+    print("Keywords:\n", keywords)
+
+if __name__ == "__main__":
+    main()
