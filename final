@@ -1,0 +1,211 @@
+import re
+import string
+import numpy as np
+import pandas as pd
+import nltk
+from nltk import word_tokenize
+from nltk.stem import WordNetLemmatizer
+from scipy.sparse import lil_matrix, csr_matrix
+from gensim import corpora, models
+
+# Ensure these NLTK resources are available
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger')
+nltk.download('wordnet')
+
+def clean_text(text):
+    """Clean text similarly to your original implementation."""
+    if isinstance(text, float):
+        return ""
+    text = text.lower()
+    printable = set(string.printable)
+    return "".join(ch for ch in text if ch in printable)
+
+def find_keywords(text):
+    """
+    Extract keywords using the same logic as your original code but with two major changes:
+    1. The co-occurrence matrix is built as a sparse matrix.
+    2. The PageRank update is fully vectorized.
+    """
+    # --- 1. Clean and tokenize ---
+    cleaned_text = clean_text(text)
+    tokens = word_tokenize(cleaned_text)
+    if not tokens:
+        return ""
+    
+    # --- 2. POS tagging and lemmatization ---
+    pos_tags = nltk.pos_tag(tokens)
+    lemmatizer = WordNetLemmatizer()
+    adjective_tags = {"JJ", "JJR", "JJS"}
+    lemmatized_text = [
+        lemmatizer.lemmatize(word, "a") if tag in adjective_tags else lemmatizer.lemmatize(word)
+        for word, tag in pos_tags
+    ]
+    pos_tags_2 = nltk.pos_tag(lemmatized_text)
+    
+    # Build stopword list based on POS filtering: keep only certain tags
+    keep_tags = {"NN", "NNS", "NNP", "NNPS", "JJ", "JJR", "JJS", "VBG", "FW"}
+    removed_words = [w for (w, t) in pos_tags_2 if t not in keep_tags]
+    
+    # Also use punctuation and an optional file of extra stopwords
+    punctuation = list(string.punctuation)
+    additional_stopwords = []
+    try:
+        with open("long_stopwords.txt", "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    additional_stopwords.append(line)
+    except FileNotFoundError:
+        pass
+    stopwords_plus = set(removed_words + punctuation + additional_stopwords)
+    
+    # Filter out the stopwords
+    processed_text = [w for w in lemmatized_text if w not in stopwords_plus]
+    if not processed_text:
+        return ""
+    
+    # --- 3. Build the sparse co-occurrence (adjacency) matrix ---
+    vocabulary = list(set(processed_text))
+    vocab_len = len(vocabulary)
+    word_index = {word: idx for idx, word in enumerate(vocabulary)}
+    window_size = 3
+    
+    # Use a sparse matrix for efficiency
+    weighted_edge = lil_matrix((vocab_len, vocab_len), dtype=np.float32)
+    
+    # Build edges over each sliding window
+    for start_i in range(len(processed_text) - window_size + 1):
+        window_words = processed_text[start_i : start_i + window_size]
+        for j in range(window_size):
+            idx_i = word_index[window_words[j]]
+            for k in range(j + 1, window_size):
+                idx_j = word_index[window_words[k]]
+                if idx_i == idx_j:
+                    continue
+                # Use distance-based weighting: 1/distance (with safeguard)
+                dist = abs(j - k) or 1
+                weighted_edge[idx_i, idx_j] += 1.0 / dist
+                weighted_edge[idx_j, idx_i] += 1.0 / dist
+
+    # --- 4. Vectorized PageRank Computation ---
+    # Convert to CSR format for fast arithmetic operations
+    weighted_edge = weighted_edge.tocsr()
+    
+    # Compute the "inout" for each node as in the original logic
+    inout = np.array(weighted_edge.sum(axis=1)).flatten()
+    inout[inout == 0] = 1e-9  # prevent division by zero
+
+    # Build a normalized transition matrix T where T[i,j] = weighted_edge[i,j] / inout[j]
+    T_csc = weighted_edge.tocsc()
+    for j in range(vocab_len):
+        start_ptr, end_ptr = T_csc.indptr[j], T_csc.indptr[j+1]
+        if inout[j] != 0:
+            T_csc.data[start_ptr:end_ptr] /= inout[j]
+    T = T_csc.tocsr()
+    
+    # PageRank parameters
+    damping_factor = 0.85
+    max_iterations = 50
+    threshold = 1e-4
+    score = np.ones(vocab_len, dtype=np.float32)
+    
+    # Vectorized update using matrix-vector multiplication
+    for _ in range(max_iterations):
+        prev_score = score.copy()
+        score = (1 - damping_factor) + damping_factor * (T.dot(prev_score))
+        if np.sum(np.abs(prev_score - score)) <= threshold:
+            break
+
+    # --- 5. Build phrases ---
+    phrases = []
+    current_phrase = []
+    for w in lemmatized_text:
+        if w in stopwords_plus:
+            if current_phrase:
+                phrases.append(current_phrase)
+                current_phrase = []
+        else:
+            current_phrase.append(w)
+    if current_phrase:
+        phrases.append(current_phrase)
+    
+    # Remove duplicate phrases while preserving order
+    unique_phrases = []
+    seen = set()
+    for ph in phrases:
+        tup = tuple(ph)
+        if tup not in seen:
+            seen.add(tup)
+            unique_phrases.append(ph)
+    
+    # Remove single-word phrases if they appear within any multi-word phrase
+    for w in vocabulary:
+        single = [w]
+        if single in unique_phrases:
+            for ph in unique_phrases:
+                if len(ph) > 1 and w in ph:
+                    unique_phrases.remove(single)
+                    break
+
+    # --- 6. Score phrases and select the top keywords ---
+    phrase_scores = []
+    keywords = []
+    for ph in unique_phrases:
+        p_score = sum(score[word_index[w]] for w in ph if w in word_index)
+        phrase_scores.append(p_score)
+        keywords.append(" ".join(ph))
+    
+    # Sort keywords by score in descending order and select top 50
+    sorted_idx = np.argsort(phrase_scores)[::-1]
+    keywords_num = min(50, len(sorted_idx))
+    top_keywords = [keywords[i] for i in sorted_idx[:keywords_num]]
+    
+    return ", ".join(top_keywords)
+
+def topic_mining(documents, num_topics=5, passes=10):
+    """
+    Given a list of document texts, extract keywords from each document,
+    tokenize them, and perform LDA topic mining using gensim.
+    """
+    # Extract keywords for each document
+    docs_keywords = []
+    for doc in documents:
+        kw = find_keywords(doc)
+        if kw:  # only include if non-empty
+            # Split keywords on comma and strip extra whitespace
+            docs_keywords.append([w.strip() for w in kw.split(",") if w.strip()])
+    
+    if not docs_keywords:
+        print("No keywords extracted; cannot perform topic mining.")
+        return
+
+    # Build a gensim dictionary and corpus
+    dictionary = corpora.Dictionary(docs_keywords)
+    corpus = [dictionary.doc2bow(doc) for doc in docs_keywords]
+    
+    # Train the LDA model
+    lda_model = models.LdaModel(corpus, num_topics=num_topics, id2word=dictionary, passes=passes, random_state=42)
+    
+    # Display the topics
+    print("\nLDA Topics:")
+    for idx, topic in lda_model.print_topics(-1):
+        print(f"Topic {idx}: {topic}\n")
+
+def main():
+    # Load the Excel file and target column (adjust the path and column index as needed)
+    df = pd.read_excel(r"C:/Users/2025344/Demo1/issues_data.xlsx")
+    # Assume each row in column 13 is a separate document for topic mining
+    documents = df.iloc[:, 13].dropna().astype(str).tolist()
+    
+    # Extract and print keywords for the entire combined text (if desired)
+    combined_text = " ".join(documents)
+    overall_keywords = find_keywords(combined_text)
+    print("Top keywords/phrases from combined text:")
+    print(overall_keywords)
+    
+    # Perform topic mining using the keywords extracted per document
+    topic_mining(documents, num_topics=5, passes=10)
+
+if __name__ == "__main__":
+    main()
