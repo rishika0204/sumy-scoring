@@ -7,7 +7,7 @@ from nltk import word_tokenize
 from nltk.stem import WordNetLemmatizer
 from scipy.sparse import lil_matrix, csr_matrix
 
-# For LDA and NMF
+# For LDA (and optionally NMF)
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.decomposition import LatentDirichletAllocation, NMF
 
@@ -17,7 +17,7 @@ nltk.download('averaged_perceptron_tagger')
 nltk.download('wordnet')
 
 def clean_text(text):
-    """Clean text similarly to your original approach."""
+    """Clean text similarly to your original implementation."""
     if isinstance(text, float):
         return ""
     text = text.lower()
@@ -26,8 +26,8 @@ def clean_text(text):
 
 def find_keywords(text):
     """
-    PageRank-based keyword extraction over a sparse co-occurrence matrix,
-    with extra logic to remove consecutive duplicate words in a phrase.
+    Extract keywords using your PageRank-based approach over a sparse co-occurrence matrix.
+    This version also removes consecutive duplicate words within a phrase.
     """
     # --- 1. Clean and tokenize ---
     cleaned_text = clean_text(text)
@@ -45,11 +45,11 @@ def find_keywords(text):
     ]
     pos_tags_2 = nltk.pos_tag(lemmatized_text)
     
-    # Build a stopword list based on POS filtering (keep only certain tags)
+    # Keep only certain POS tags
     keep_tags = {"NN", "NNS", "NNP", "NNPS", "JJ", "JJR", "JJS", "VBG", "FW"}
     removed_words = [w for (w, t) in pos_tags_2 if t not in keep_tags]
     
-    # Also remove punctuation and any optional external stopwords
+    # Remove punctuation and optional external stopwords
     punctuation = list(string.punctuation)
     additional_stopwords = []
     try:
@@ -60,10 +60,9 @@ def find_keywords(text):
                     additional_stopwords.append(line)
     except FileNotFoundError:
         pass
-    
     stopwords_plus = set(removed_words + punctuation + additional_stopwords)
     
-    # Filter out these stopwords from the text
+    # Filter out the stopwords
     processed_text = [w for w in lemmatized_text if w not in stopwords_plus]
     if not processed_text:
         return ""
@@ -73,7 +72,6 @@ def find_keywords(text):
     vocab_len = len(vocabulary)
     word_index = {word: idx for idx, word in enumerate(vocabulary)}
     window_size = 3
-    
     weighted_edge = lil_matrix((vocab_len, vocab_len), dtype=np.float32)
     
     for start_i in range(len(processed_text) - window_size + 1):
@@ -88,12 +86,11 @@ def find_keywords(text):
                 weighted_edge[idx_i, idx_j] += 1.0 / dist
                 weighted_edge[idx_j, idx_i] += 1.0 / dist
 
-    # --- 4. PageRank Computation ---
+    # --- 4. Compute PageRank ---
     weighted_edge = weighted_edge.tocsr()
-    
     inout = np.array(weighted_edge.sum(axis=1)).flatten()
     inout[inout == 0] = 1e-9  # prevent division by zero
-
+    
     # Normalize columns to build transition matrix T
     T_csc = weighted_edge.tocsc()
     for j in range(vocab_len):
@@ -135,7 +132,7 @@ def find_keywords(text):
             seen.add(tup)
             unique_phrases.append(ph)
     
-    # Optional: remove single-word phrases if they appear in multi-word phrases
+    # Optional: remove single-word phrases if they appear within any multi-word phrase
     for w in vocabulary:
         single = [w]
         if single in unique_phrases:
@@ -143,9 +140,8 @@ def find_keywords(text):
                 if len(ph) > 1 and w in ph:
                     unique_phrases.remove(single)
                     break
-
-    # **Remove consecutive duplicates** in each phrase,
-    # turning ["client", "client", "investment"] -> ["client", "investment"]
+    
+    # Remove consecutive duplicate words (e.g., "client client investment" -> "client investment")
     deduped_phrases = []
     for ph in unique_phrases:
         if not ph:
@@ -156,7 +152,7 @@ def find_keywords(text):
                 cleaned.append(ph[i])
         deduped_phrases.append(cleaned)
     
-    # --- 6. Score phrases and select the top keywords ---
+    # --- 6. Score phrases and select top keywords ---
     phrase_scores = []
     keywords_list = []
     for ph in deduped_phrases:
@@ -170,70 +166,64 @@ def find_keywords(text):
     
     return ", ".join(top_keywords)
 
-def topic_modeling_lda(documents, n_topics=8, n_top_words=10):
+def topic_modeling_with_keywords_lda(documents, n_topics=8, top_n_docs=10):
     """
-    LDA topic modeling with phrase-level (n-gram) features.
+    Fit an LDA model on the corpus. For each topic:
+      1. Sort documents by their probability for that topic.
+      2. Select the top N documents.
+      3. Aggregate their text into one string.
+      4. Run the PageRank-based keyword extraction (find_keywords) on that aggregated text.
+    The output uses the keywords from find_keywords as the topic terms.
     """
-    # Use n-grams up to size 2 or 3 to get short phrases
-    vectorizer = CountVectorizer(stop_words='english', max_df=0.95, min_df=2,
-                                 ngram_range=(1, 2))  # (1,2) = unigrams + bigrams
+    from sklearn.feature_extraction.text import CountVectorizer
+    from sklearn.decomposition import LatentDirichletAllocation
+
+    print("\n=== LDA Topic Modeling with PageRank-based Topic Terms ===")
+    
+    # Convert documents to a bag-of-words representation
+    vectorizer = CountVectorizer(stop_words='english', max_df=0.95, min_df=2)
     doc_term_matrix = vectorizer.fit_transform(documents)
     
+    # Fit LDA model
     lda_model = LatentDirichletAllocation(n_components=n_topics, random_state=42)
     lda_model.fit(doc_term_matrix)
     
-    feature_names = vectorizer.get_feature_names_out()
+    # Get topic probabilities for each document
+    doc_topic_probs = lda_model.transform(doc_term_matrix)
     
-    print("\nLDA Topics (using n-grams):")
-    for topic_idx, topic in enumerate(lda_model.components_):
-        # Sort by descending weight
-        top_indices = topic.argsort()[::-1][:n_top_words]
-        top_features = [feature_names[i] for i in top_indices]
-        print(f"Topic {topic_idx+1}: {', '.join(top_features)}")
+    for topic_idx in range(n_topics):
+        # Sort documents by their probability for this topic (descending order)
+        sorted_docs = np.argsort(doc_topic_probs[:, topic_idx])[::-1]
+        top_doc_indices = sorted_docs[:top_n_docs]
+        
+        # Aggregate the text of the top documents for this topic
+        topic_text = " ".join([documents[i] for i in top_doc_indices])
+        
+        # Use your PageRank-based keyword extraction on the aggregated topic text
+        topic_keywords = find_keywords(topic_text)
+        
+        print(f"\nTopic {topic_idx+1} (PageRank-based Keywords):")
+        print(topic_keywords)
 
-def topic_modeling_nmf(documents, n_topics=8, n_top_words=10):
-    """
-    NMF topic modeling with phrase-level (n-gram) features.
-    """
-    # Use TF-IDF with bigrams
-    vectorizer = TfidfVectorizer(stop_words='english', max_df=0.95, min_df=2,
-                                 ngram_range=(1, 2))
-    tfidf_matrix = vectorizer.fit_transform(documents)
-    
-    nmf_model = NMF(n_components=n_topics, random_state=42)
-    nmf_model.fit(tfidf_matrix)
-    
-    feature_names = vectorizer.get_feature_names_out()
-    
-    print("\nNMF Topics (using n-grams):")
-    for topic_idx, topic in enumerate(nmf_model.components_):
-        # Sort by descending weight
-        top_indices = topic.argsort()[::-1][:n_top_words]
-        top_features = [feature_names[i] for i in top_indices]
-        print(f"Topic {topic_idx+1}: {', '.join(top_features)}")
+# Optional: you can also create a similar function for NMF if needed.
 
 def main():
-    # Load your data; adjust the file path and column index
+    # Load your data from an Excel file (adjust the file path and column index as needed)
     df = pd.read_excel(r"C:/Users/2025344/Demo1/issues_data.xlsx")
+    # Assume that the text is in the 14th column (index 13)
     column_data = df.iloc[:, 13]
     
-    # Convert each row to a string for topic modeling
+    # Convert each row to a string and drop missing values
     documents = column_data.dropna().astype(str).tolist()
     
-    # 1. PageRank-based keywords on aggregated text
+    # 1. Run the PageRank-based keyword extraction on the aggregated text (for reference)
     combined_text = " ".join(documents)
-    # If you want an 80% portion of that text, do:
-    split_index = int(len(combined_text) * 0.8)
-    train_text = combined_text[:split_index]
-    keywords = find_keywords(train_text)
-    print("Top keywords/phrases (PageRank-based):")
-    print(keywords)
+    overall_keywords = find_keywords(combined_text)
+    print("Overall PageRank-based Keywords:")
+    print(overall_keywords)
     
-    # 2. Topic modeling with LDA and n-grams
-    topic_modeling_lda(documents, n_topics=8, n_top_words=10)
-    
-    # 3. Topic modeling with NMF and n-grams
-    topic_modeling_nmf(documents, n_topics=8, n_top_words=10)
+    # 2. Run LDA-based topic modeling and use find_keywords for topic terms
+    topic_modeling_with_keywords_lda(documents, n_topics=8, top_n_docs=10)
 
 if __name__ == "__main__":
     main()
