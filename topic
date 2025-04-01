@@ -1,0 +1,171 @@
+import re
+import string
+import numpy as np
+import pandas as pd
+import nltk
+from nltk import word_tokenize
+from nltk.stem import WordNetLemmatizer
+from scipy.sparse import lil_matrix, csr_matrix
+from sklearn.cluster import KMeans
+
+# Ensure these NLTK resources are available
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger')
+nltk.download('wordnet')
+
+def clean_text(text):
+    """Clean text similarly to your original implementation."""
+    if isinstance(text, float):
+        return ""
+    text = text.lower()
+    printable = set(string.printable)
+    return "".join(ch for ch in text if ch in printable)
+
+def extract_graph_and_scores(text, window_size=3, damping_factor=0.85,
+                               max_iterations=50, threshold=1e-4):
+    """
+    Process the entire aggregated text to:
+      1. Clean, tokenize, POS tag, and lemmatize.
+      2. Build a sparse co-occurrence (adjacency) matrix.
+      3. Compute PageRank scores for each unique word.
+    Returns:
+      - vocabulary: list of words (unique, after processing)
+      - word_index: dictionary mapping word -> index in vocabulary
+      - score: PageRank scores for each word (numpy array)
+      - weighted_edge: the sparse co-occurrence matrix (CSR format)
+      - lemmatized_text: list of tokens (after lemmatization)
+      - stopwords_plus: the set of words filtered out (for later phrase extraction if needed)
+    """
+    # --- 1. Clean and tokenize ---
+    cleaned_text = clean_text(text)
+    tokens = word_tokenize(cleaned_text)
+    if not tokens:
+        return None, None, None, None, None, None
+
+    # --- 2. POS tagging and lemmatization ---
+    pos_tags = nltk.pos_tag(tokens)
+    lemmatizer = WordNetLemmatizer()
+    adjective_tags = {"JJ", "JJR", "JJS"}
+    lemmatized_text = [
+        lemmatizer.lemmatize(word, "a") if tag in adjective_tags else lemmatizer.lemmatize(word)
+        for word, tag in pos_tags
+    ]
+    pos_tags_2 = nltk.pos_tag(lemmatized_text)
+    
+    # Build stopword list based on POS filtering: keep only certain tags
+    keep_tags = {"NN", "NNS", "NNP", "NNPS", "JJ", "JJR", "JJS", "VBG", "FW"}
+    removed_words = [w for (w, t) in pos_tags_2 if t not in keep_tags]
+    
+    # Also use punctuation and an optional file of extra stopwords
+    punctuation = list(string.punctuation)
+    additional_stopwords = []
+    try:
+        with open("long_stopwords.txt", "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    additional_stopwords.append(line)
+    except FileNotFoundError:
+        pass
+    stopwords_plus = set(removed_words + punctuation + additional_stopwords)
+    
+    # Filter out stopwords from the lemmatized text
+    processed_text = [w for w in lemmatized_text if w not in stopwords_plus]
+    if not processed_text:
+        return None, None, None, None, None, None
+    
+    # --- 3. Build the sparse co-occurrence matrix ---
+    vocabulary = list(set(processed_text))
+    vocab_len = len(vocabulary)
+    word_index = {word: idx for idx, word in enumerate(vocabulary)}
+    weighted_edge = lil_matrix((vocab_len, vocab_len), dtype=np.float32)
+    
+    for start_i in range(len(processed_text) - window_size + 1):
+        window_words = processed_text[start_i : start_i + window_size]
+        for j in range(window_size):
+            idx_i = word_index[window_words[j]]
+            for k in range(j + 1, window_size):
+                idx_j = word_index[window_words[k]]
+                if idx_i == idx_j:
+                    continue
+                # Use distance-based weighting: 1/distance (with safeguard)
+                dist = abs(j - k) or 1
+                weighted_edge[idx_i, idx_j] += 1.0 / dist
+                weighted_edge[idx_j, idx_i] += 1.0 / dist
+
+    # --- 4. Compute PageRank scores ---
+    weighted_edge = weighted_edge.tocsr()
+    # Compute sum of weights (inout) for each node
+    inout = np.array(weighted_edge.sum(axis=1)).flatten()
+    inout[inout == 0] = 1e-9  # prevent division by zero
+
+    # Normalize columns to build the transition matrix T
+    T_csc = weighted_edge.tocsc()
+    for j in range(vocab_len):
+        start_ptr, end_ptr = T_csc.indptr[j], T_csc.indptr[j+1]
+        if inout[j] != 0:
+            T_csc.data[start_ptr:end_ptr] /= inout[j]
+    T = T_csc.tocsr()
+    
+    # Initialize PageRank scores
+    score = np.ones(vocab_len, dtype=np.float32)
+    for _ in range(max_iterations):
+        prev_score = score.copy()
+        score = (1 - damping_factor) + damping_factor * (T.dot(prev_score))
+        if np.sum(np.abs(prev_score - score)) <= threshold:
+            break
+
+    return vocabulary, word_index, score, weighted_edge, lemmatized_text, stopwords_plus
+
+def cluster_keywords(vocabulary, score, co_occurrence, n_topics=8, keywords_per_topic=10):
+    """
+    Cluster the vocabulary into topics using k-means on the co-occurrence matrix rows.
+    Then, for each cluster, rank the words by their PageRank score and select the top keywords.
+    Returns a dictionary mapping topic number to a list of keywords.
+    """
+    # Convert the sparse co-occurrence matrix to dense representation.
+    # (For very large vocabularies you might consider other approaches.)
+    dense_matrix = co_occurrence.toarray()
+    
+    # Apply k-means clustering
+    kmeans = KMeans(n_clusters=n_topics, random_state=42)
+    clusters = kmeans.fit_predict(dense_matrix)
+    
+    # Prepare a mapping from cluster to words with scores
+    topic_keywords = {i: [] for i in range(n_topics)}
+    for i, word in enumerate(vocabulary):
+        topic_keywords[clusters[i]].append((word, score[i]))
+    
+    # For each cluster, sort the words by PageRank score in descending order and select top keywords
+    top_topic_keywords = {}
+    for topic, words in topic_keywords.items():
+        sorted_words = sorted(words, key=lambda x: x[1], reverse=True)
+        top_topic_keywords[f"Topic {topic+1}"] = [word for word, _ in sorted_words[:keywords_per_topic]]
+    
+    return top_topic_keywords
+
+def main():
+    # Load the Excel file and target column (adjust the path and column index as needed)
+    df = pd.read_excel(r"C:/Users/2025344/Demo1/issues_data.xlsx")
+    # Assuming the text is in column 13 (0-indexed: column 12) or adjust as needed
+    column_data = df.iloc[:, 13]
+    combined_text = " ".join(column_data.dropna().astype(str).tolist())
+    
+    # Aggregate the entire text and extract the co-occurrence graph and PageRank scores
+    vocabulary, word_index, score, co_occurrence, lemmatized_text, stopwords_plus = extract_graph_and_scores(combined_text)
+    
+    if vocabulary is None:
+        print("No text available after processing.")
+        return
+    
+    # Cluster the keywords into topics (here using 8 topics, ~10 keywords each)
+    topics = cluster_keywords(vocabulary, score, co_occurrence, n_topics=8, keywords_per_topic=10)
+    
+    print("Top keywords/phrases by topic:")
+    for topic, keywords in topics.items():
+        print(f"{topic}:")
+        print(", ".join(keywords))
+        print()
+
+if __name__ == "__main__":
+    main()
