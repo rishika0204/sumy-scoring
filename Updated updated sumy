@@ -1,0 +1,243 @@
+import pandas as pd
+import logging
+import re
+import numpy as np
+
+from sumy.parsers.plaintext import PlaintextParser
+from sumy.nlp.tokenizers import Tokenizer
+from sumy.nlp.stemmers import Stemmer
+from sumy.utils import get_stop_words
+from sumy.summarizers.lsa import LsaSummarizer
+
+# We need sparse matrix libraries from SciPy.
+from scipy.sparse import lil_matrix, csr_matrix
+from scipy.sparse.linalg import svds
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def preprocess_text(text):
+    """
+    Preprocess the input text by removing unwanted characters and formatting.
+    
+    Args:
+        text (str): The input text to preprocess.
+        
+    Returns:
+        str: The preprocessed text.
+    """
+    text = re.sub(r'\d+\.', '', text)  # Remove points like 1., 2., 3.
+    text = re.sub(r'\^', '', text)     # Remove '^'
+    text = re.sub(r'\d+\)', '', text)   # Remove digits followed by ')'
+    text = re.sub(r'\b[a-zA-Z]+\)', '', text)  # Remove letters followed by ')'
+    text = re.sub(r'\([^)]*\)', '', text)  # Remove text within parentheses
+    text = re.sub(r'\*+', '', text)  # Remove bullet points
+    text = re.sub(r'\s+', ' ', text).strip()  # Remove extra whitespace
+    text = text.replace('(', '').replace(')', '')  # Remove stray parentheses
+    return text
+
+###############################################################################
+# Modified (Optimized) Sumy LSA Summarizer using sparse matrices (with sentence smoothing)
+###############################################################################
+class OptimizedLsaSummarizer(LsaSummarizer):
+    def __init__(self, stemmer, language="english", **kwargs):
+        super().__init__(stemmer, language, **kwargs)
+        self.stop_words = get_stop_words(language)
+
+    def _create_matrix(self, document, dictionary):
+        """
+        Create a sparse term-sentence matrix based on the given dictionary.
+        After counting token occurrences, ensure each sentence (matrix row) has at least one nonzero value.
+        
+        Args:
+            document: A Sumy Document object containing sentences.
+            dictionary: A mapping (dict) from terms to their index.
+            
+        Returns:
+            A csr_matrix of shape (num_sentences, num_terms)
+        """
+        sentences = document.sentences
+        num_sent = len(sentences)
+        num_terms = len(dictionary)
+        # Use lil_matrix for incremental construction.
+        matrix = lil_matrix((num_sent, num_terms), dtype=float)
+        
+        # Build the term frequency matrix (ignoring stop words)
+        for i, sentence in enumerate(sentences):
+            for word in sentence.words:
+                word_lower = word.lower()
+                if word_lower in self.stop_words:
+                    continue
+                if word_lower in dictionary:
+                    j = dictionary[word_lower]
+                    matrix[i, j] += 1.0
+        
+        # Convert to CSR for efficiency in subsequent operations.
+        matrix = matrix.tocsr()
+        # Smoothing: For any sentence that is all zeros, add a small constant
+        epsilon = 1e-6
+        for i in range(num_sent):
+            if matrix[i].nnz == 0 and num_terms > 0:
+                # Assign a minimal value to the first column for this sentence
+                matrix[i, 0] = epsilon
+        return matrix
+
+    def _compute_term_frequency(self, matrix):
+        """
+        Compute term frequencies with a logarithmic scaling while keeping the matrix sparse.
+        For each non-zero element x in the matrix, set it to 1 + log(x).
+        """
+        matrix = matrix.copy()
+        if matrix.nnz > 0:
+            matrix.data = 1 + np.log(matrix.data)
+        return matrix
+
+    def _compute_ranks(self, sigma, vt):
+        """
+        Compute sentence ranks from the right-singular vectors.
+        
+        Args:
+            sigma: 1D array of singular values.
+            vt: 2D array from the SVD decomposition (shape: (k, num_sentences)).
+            
+        Returns:
+            1D numpy array containing the rank for each sentence.
+        """
+        # For each sentence i, rank_i = sum_{k} sigma[k] * |vt[k, i]|
+        num_sent = vt.shape[1]
+        ranks = np.zeros(num_sent)
+        for i in range(num_sent):
+            ranks[i] = np.sum(sigma * np.abs(vt[:, i]))
+        return ranks
+
+    def __call__(self, document, sentence_count):
+        """
+        Override the call method to use sparse SVD for summarization.
+        
+        Args:
+            document: The Sumy Document object.
+            sentence_count: The number of sentences desired in the summary.
+            
+        Returns:
+            A list of the top-sentences as selected Sentence objects.
+        """
+        dictionary = self._create_dictionary(document)
+        if not dictionary:
+            return []
+        matrix = self._create_matrix(document, dictionary)
+        matrix = self._compute_term_frequency(matrix)
+        
+        # Use sparse SVD. Choose k = min(num_sentences, num_terms) - 1.
+        k = min(matrix.shape) - 1
+        if k < 1:
+            k = 1
+        try:
+            # Compute k largest singular values/vectors using svds
+            u, sigma, vt = svds(matrix, k=k)
+        except Exception:
+            # Fallback to dense SVD if sparse method fails.
+            dense_matrix = matrix.toarray()
+            u, sigma, vt = np.linalg.svd(dense_matrix, full_matrices=False)
+        # Compute importance rank for each sentence.
+        ranks = self._compute_ranks(sigma, vt)
+        scored_sentences = [(sentence, rank) for sentence, rank in zip(document.sentences, ranks)]
+        # Sort sentences by rank in descending order.
+        sorted_sentences = sorted(scored_sentences, key=lambda s: s[1], reverse=True)
+        # Select top 'sentence_count' sentences and sort them by their original order.
+        selected_sentences = sorted(sorted_sentences[:sentence_count], key=lambda s: s[0].start)
+        return [s[0] for s in selected_sentences]
+
+###############################################################################
+# Updated Summarization Function Using the Optimized Sumy Summarizer
+###############################################################################
+def summarize_paragraph(paragraph, percentage=0.2, max_sentences=15):
+    """
+    Summarize a paragraph using the optimized Sumy LSA summarizer (which now uses sparse matrices
+    with smoothing so that all sentences receive at least a minimal score). Also compute sentence scores.
+    
+    Args:
+        paragraph (str): The input paragraph to summarize.
+        percentage (float): The fraction of sentences to include in the summary.
+        max_sentences (int): Maximum sentences allowed in the summary.
+        
+    Returns:
+        tuple: (summary_text, sentence_score_tuples)
+            summary_text: The concatenated summary sentences.
+            sentence_score_tuples: List of tuples (sentence, score) for each original sentence.
+    """
+    if isinstance(paragraph, float):
+        return "", []  # Skip if paragraph is not a valid string
+    
+    paragraph = preprocess_text(paragraph)
+    parser = PlaintextParser.from_string(paragraph, Tokenizer("english"))
+    stemmer = Stemmer("english")
+    summarizer = OptimizedLsaSummarizer(stemmer)
+    summarizer.stop_words = get_stop_words("english")
+    
+    num_sentences = len(parser.document.sentences)
+    sentence_count = min(max(1, int(num_sentences * percentage)), max_sentences)
+    
+    summary_sentences = summarizer(parser.document, sentence_count)
+    summary_text = " ".join([str(sentence) for sentence in summary_sentences])
+    
+    # Recompute sentence scores for reporting.
+    dictionary = summarizer._create_dictionary(parser.document)
+    if not dictionary:
+        sentence_score_tuples = []
+    else:
+        matrix = summarizer._create_matrix(parser.document, dictionary)
+        matrix = summarizer._compute_term_frequency(matrix)
+        k = min(matrix.shape) - 1
+        if k < 1:
+            k = 1
+        try:
+            u, sigma, vt = svds(matrix, k=k)
+        except Exception:
+            dense_matrix = matrix.toarray()
+            u, sigma, vt = np.linalg.svd(dense_matrix, full_matrices=False)
+        ranks = summarizer._compute_ranks(sigma, vt)
+        sentence_score_tuples = [(str(sentence), rank) for sentence, rank in zip(parser.document.sentences, ranks)]
+        sentence_score_tuples = sorted(sentence_score_tuples, key=lambda x: x[1], reverse=True)
+    
+    return summary_text, sentence_score_tuples
+
+###############################################################################
+# DataFrame Processing (remains similar to your original design)
+###############################################################################
+def process_dataframe(df, column_index, output_path):
+    """
+    Process each row in the DataFrame, summarize the text in the specified column,
+    and append the results.
+    
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        column_index (int): Column index containing the text to summarize.
+        output_path (str): Path to save the updated Excel file.
+    """
+    summaries_list = []
+    sentence_scores_list = []
+    
+    for index, row in df.iterrows():
+        paragraph = row.iloc[column_index]
+        logging.info(f"Processing row {index + 1}")
+        summary, sentence_scores = summarize_paragraph(paragraph)
+        summaries_list.append(summary)
+        sentence_scores_list.append(sentence_scores)
+    
+    df['Summary using Optimized Sumy'] = summaries_list
+    df['Sentence Scores'] = sentence_scores_list
+    
+    df.to_excel(output_path, index=False)
+    logging.info("Summarization and appending completed successfully.")
+
+def main():
+    # Input and output file paths (update as necessary)
+    input_path = r'C:\Users\2025344\Demo2\persons_data.xlsx'
+    output_path = r'C:\Users\2025344\Demo2\persons_data.xlsx'
+    df = pd.read_excel(input_path)
+    
+    # Process the DataFrame with the column index that contains the text.
+    process_dataframe(df, column_index=1, output_path=output_path)
+
+if __name__ == "__main__":
+    main()
