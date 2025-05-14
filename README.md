@@ -203,7 +203,12 @@ Code Summary Table
 
 
 
-⸻
+⸻References
+	•	Steinberger, J., & Ježek, K. (2004). Using LSA in Text Summarization and Summary Evaluation
+	•	Gong, Y., & Liu, X. (2001). Generic Text Summarization Using Relevance Measure and LSA
+	•	Sumy LSA Summarizer: https://github.com/miso-belica/sumy
+	•	spaCy, NLTK, Pandas, SciPy
+
 
 Let me know if you’d like:
 	•	This as a .docx export
