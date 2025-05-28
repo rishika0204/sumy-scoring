@@ -1,0 +1,84 @@
+import re
+from typing import List, Tuple
+
+import spacy
+from nltk.tokenize import sent_tokenize
+
+# Load spaCy English model (medium-sized)
+nlp = spacy.load("en_core_web_md")
+
+
+def preprocess_text_and_filter_headings(
+    text: str
+) -> Tuple[str, int]:
+    """
+    Clean, split, and filter a summary paragraph.
+
+    Steps:
+      1. Remove bullets, numbers, special patterns, and attachments.
+      2. Strip out all-uppercase headings.
+      3. Tokenize into sentences.
+      4. Filter out headings/incomplete sentences via spaCy parses.
+      5. Split overly-long sentences (len >50 words) on colons/hyphens.
+      6. Final cleanup: drop too-short (<5 words) or matched-universe patterns.
+      7. Return joined text and count of processed sentences.
+
+    Args:
+        text (str): Raw paragraph to process.
+
+    Returns:
+        Tuple[str, int]: (processed_summary, sentence_count)
+    """
+    # Early exit for invalid input
+    if not isinstance(text, str) or not text.strip():
+        return "", 0
+
+    # 1. Remove bullets, numbers, lists, and attachment references
+    patterns = [
+        (r"^\s*[•*\-\u2022]+", ""),  # bullets at line start
+        (r"^\s*\d+[\.:]\s*", ""),    # numbered lists
+        (r"\(See attachment.*?\)", ""), # inline attachment refs
+        (r"\b\w\.\b", ""),          # single-letter a. or b.
+    ]
+    for pat, repl in patterns:
+        text = re.sub(pat, repl, text, flags=re.MULTILINE | re.IGNORECASE)
+
+    # Normalize whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # 2. Remove lines of all uppercase headings
+    text = re.sub(r"^(?:[A-Z]{2,}\s*)$", "", text, flags=re.MULTILINE)
+
+    # 3. Sentence tokenization
+    sentences = sent_tokenize(text)
+
+    # 4. Filter via spaCy: must contain subject & verb, skip all-uppercase
+    valid: List[str] = []
+    for sent in sentences:
+        if sent.isupper():
+            continue
+        doc = nlp(sent)
+        has_subj = any(tok.dep_ in ("nsubj", "nsubjpass") for tok in doc)
+        has_verb = any(tok.pos_ == "VERB" for tok in doc)
+        if has_subj and has_verb:
+            valid.append(sent)
+
+    if not valid:
+        return "", 0
+
+    # 5. Split overly long sentences >50 words on colons or hyphens
+    processed: List[str] = []
+    for sent in valid:
+        words = sent.split()
+        if len(words) > 50:
+            split_sents = re.split(r"[:\-]", sent)
+            processed.extend(split_sents)
+        else:
+            processed.append(sent)
+
+    # 6. Final cleanup: strip, drop <5-word sents, drop "Risk Profile ICS Risk|Process Universe"
+    cleaned = [s.strip() for s in processed]
+    cleaned = [s for s in cleaned if len(s.split()) > 5 and not re.search(r"Risk Profile ICS Risk\|Process Universe", s)]
+
+    # Return joined summary and count
+    return " ".join(cleaned), len(cleaned)
